@@ -579,8 +579,6 @@ PaError PaPulseAudio_CloseStreamCb( PaStream * s )
     PaPulseAudio_Stream *stream = (PaPulseAudio_Stream *) s;
     PaPulseAudio_HostApiRepresentation *pulseaudioHostApi = stream->hostapi;
     pa_operation *pulseaudioOperation = NULL;
-    int waitLoop = 0;
-    int pulseaudioError = 0;
 
     /* Wait for stream to be stopped */
     stream->isActive = 0;
@@ -630,37 +628,24 @@ PaError PaPulseAudio_CloseStreamCb( PaStream * s )
 
     }
 
-    /* Wait for termination for both */
-    while(!waitLoop)
+    /* Release both PulseAudio stream objects. Streams that are still in a good
+     * state were disconnected above and transition to TERMINATED; streams that
+     * already FAILED (e.g. USB device unplugged or PulseAudio restarted) never
+     * become TERMINATED, so unconditionally dropping the last reference here
+     * guarantees they are freed in every situation instead of leaking after a
+     * 50 second busy-wait. */
+    PaPulseAudio_Lock( stream->mainloop );
+    if( stream->inputStream != NULL )
     {
-        PaPulseAudio_Lock( stream->mainloop );
-        if( stream->inputStream != NULL
-            && !PA_STREAM_IS_GOOD( pa_stream_get_state( stream->inputStream ) ) )
-        {
-            pa_stream_unref( stream->inputStream );
-            stream->inputStream = NULL;
-        }
-        PaPulseAudio_UnLock( stream->mainloop );
-
-        PaPulseAudio_Lock( stream->mainloop );
-        if( stream->outputStream != NULL
-            && !PA_STREAM_IS_GOOD( pa_stream_get_state( stream->outputStream ) ) )
-        {
-            pa_stream_unref( stream->outputStream );
-            stream->outputStream = NULL;
-        }
-        PaPulseAudio_UnLock( stream->mainloop );
-
-        if((stream->outputStream == NULL
-           && stream->inputStream == NULL)
-           || pulseaudioError >= 5000 )
-        {
-            waitLoop = 1;
-        }
-
-        pulseaudioError ++;
-        usleep(10000);
+        pa_stream_unref( stream->inputStream );
+        stream->inputStream = NULL;
     }
+    if( stream->outputStream != NULL )
+    {
+        pa_stream_unref( stream->outputStream );
+        stream->outputStream = NULL;
+    }
+    PaPulseAudio_UnLock( stream->mainloop );
 
     stream->pulseaudioIsActive = 0;
     stream->pulseaudioIsStopped = 1;
@@ -731,8 +716,6 @@ PaError PaPulseAudio_StartStreamCb( PaStream * s )
 {
     PaError ret = paNoError;
     PaPulseAudio_Stream *stream = (PaPulseAudio_Stream *) s;
-    int pulseaudioPlaybackStarted = 0;
-    int pulseaudioRecordStarted = 0;
     pa_stream_state_t pulseaudioState = PA_STREAM_UNCONNECTED;
     PaPulseAudio_HostApiRepresentation *pulseaudioHostApi = stream->hostapi;
     const char *pulseaudioName = NULL;
@@ -968,14 +951,38 @@ PaError PaPulseAudio_StartStreamCb( PaStream * s )
     PA_DEBUG( ("Portaudio %s: Can't start audio!\n",
               __FUNCTION__) );
 
-    if( pulseaudioPlaybackStarted || pulseaudioRecordStarted )
+    /* Starting failed, typically because the device was unplugged, the
+     * PulseAudio server restarted, or the requested parameters are rejected.
+     * Tear down any partially established connection so that (a) no pa_stream
+     * is leaked and (b) the PortAudio stream stays in a clean stopped state
+     * and can be reopened/restarted after the device comes back. */
+    PaPulseAudio_Lock( pulseaudioHostApi->mainloop );
+    if( stream->inputStream != NULL
+        && PA_STREAM_IS_GOOD( pa_stream_get_state( stream->inputStream ) ) )
     {
-        PaPulseAudio_AbortStreamCb( stream );
+        pa_stream_disconnect( stream->inputStream );
     }
+    if( stream->outputStream != NULL
+        && PA_STREAM_IS_GOOD( pa_stream_get_state( stream->outputStream ) ) )
+    {
+        pa_stream_disconnect( stream->outputStream );
+    }
+    PaPulseAudio_UnLock( pulseaudioHostApi->mainloop );
 
     stream->isActive = 0;
     stream->isStopped = 1;
-    ret = paNotInitialized;
+    stream->pulseaudioIsActive = 0;
+    stream->pulseaudioIsStopped = 1;
+
+    if( pulseaudioHostApi->context == NULL
+        || pa_context_get_state( pulseaudioHostApi->context ) != PA_CONTEXT_READY )
+    {
+        ret = paDeviceUnavailable;
+    }
+    else
+    {
+        ret = paUnanticipatedHostError;
+    }
 
     goto startstreamcb_end;
 }

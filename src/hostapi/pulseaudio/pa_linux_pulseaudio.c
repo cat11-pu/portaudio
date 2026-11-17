@@ -1133,20 +1133,22 @@ PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
                            &stream->inputSampleSpec,
                            NULL );
 
-        if( stream->inputStream != NULL )
-        {
-            pa_stream_set_state_callback( stream->inputStream,
-                                          PaPulseAudio_StreamStateCb,
-                                          stream);
-            pa_stream_set_started_callback( stream->inputStream,
-                                            PaPulseAudio_StreamStartedCb,
-                                            stream );
-        }
-        else
+        if( stream->inputStream == NULL )
         {
             PA_DEBUG( ("Portaudio %s: Can't alloc input stream!\n",
                        __FUNCTION__) );
+            PA_PULSEAUDIO_SET_LAST_HOST_ERROR(
+                pa_context_errno( pulseaudioHostApi->context ),
+                "OpenStream: pa_stream_new() failed for input" );
+            result = paInsufficientMemory;
+            goto openstream_error;
         }
+        pa_stream_set_state_callback( stream->inputStream,
+                                      PaPulseAudio_StreamStateCb,
+                                      stream);
+        pa_stream_set_started_callback( stream->inputStream,
+                                        PaPulseAudio_StreamStartedCb,
+                                        stream );
 
         stream->inputDevice = inputParameters->device;
 
@@ -1245,25 +1247,25 @@ PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
                            &stream->outputSampleSpec,
                            NULL );
 
-        if( stream->outputStream != NULL )
-        {
-            pa_stream_set_state_callback( stream->outputStream,
-                                          PaPulseAudio_StreamStateCb,
-                                          stream );
-            pa_stream_set_started_callback( stream->outputStream,
-                                            PaPulseAudio_StreamStartedCb,
-                                            stream );
-            pa_stream_set_underflow_callback( stream->outputStream,
-                                              PaPulseAudio_StreamUnderflowCb,
-                                              stream);
-
-        }
-
-        else
+        if( stream->outputStream == NULL )
         {
             PA_DEBUG( ("Portaudio %s: Can't alloc output stream!\n",
-                      __FUNCTION__) );
+                       __FUNCTION__) );
+            PA_PULSEAUDIO_SET_LAST_HOST_ERROR(
+                pa_context_errno( pulseaudioHostApi->context ),
+                "OpenStream: pa_stream_new() failed for output" );
+            result = paInsufficientMemory;
+            goto openstream_error;
         }
+        pa_stream_set_state_callback( stream->outputStream,
+                                      PaPulseAudio_StreamStateCb,
+                                      stream );
+        pa_stream_set_started_callback( stream->outputStream,
+                                        PaPulseAudio_StreamStartedCb,
+                                        stream );
+        pa_stream_set_underflow_callback( stream->outputStream,
+                                          PaPulseAudio_StreamUnderflowCb,
+                                          stream);
 
         if( result != paNoError )
         {
@@ -1367,6 +1369,21 @@ PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
         {
             free( stream->inputRing.buffer );
             stream->inputRing.buffer = NULL;
+        }
+
+        /* Release any PulseAudio stream objects that were created before the
+         * failure occurred (e.g. unsupported spec, OOM or device unplug).
+         * pa_stream_unref() is safe for every state, including streams that
+         * were never connected. */
+        if( stream->inputStream != NULL )
+        {
+            pa_stream_unref( stream->inputStream );
+            stream->inputStream = NULL;
+        }
+        if( stream->outputStream != NULL )
+        {
+            pa_stream_unref( stream->outputStream );
+            stream->outputStream = NULL;
         }
 
         PaUtil_FreeMemory( stream->inputStreamName );

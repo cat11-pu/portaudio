@@ -2089,7 +2089,7 @@ static PaError PaAlsaStreamComponent_Initialize( PaAlsaStreamComponent *self, Pa
 error:
 
     /* Log all available formats. */
-    if ( hostSampleFormat == paSampleFormatNotSupported )
+    if ( hostSampleFormat == paSampleFormatNotSupported && self->pcm != NULL )
     {
         LogAllAvailableFormats( self->pcm );
         PA_DEBUG(( "%s: Please provide the log output to PortAudio developers, your hardware does not have any sample format implemented yet.\n", __FUNCTION__ ));
@@ -3087,6 +3087,7 @@ static void SilenceBuffer( PaAlsaStream *stream )
 static PaError AlsaStart( PaAlsaStream *stream, int priming )
 {
     PaError result = paNoError;
+    int playbackPrepared = 0;
 
     if( stream->playback.pcm )
     {
@@ -3096,6 +3097,7 @@ static PaError AlsaStart( PaAlsaStream *stream, int priming )
             {
                 /* Buffer isn't primed, so prepare and silence */
                 ENSURE_( alsa_snd_pcm_prepare( stream->playback.pcm ), paUnanticipatedHostError );
+                playbackPrepared = 1;
                 if( stream->playback.canMmap )
                     SilenceBuffer( stream );
             }
@@ -3103,7 +3105,10 @@ static PaError AlsaStart( PaAlsaStream *stream, int priming )
                 ENSURE_( alsa_snd_pcm_start( stream->playback.pcm ), paUnanticipatedHostError );
         }
         else
+        {
             ENSURE_( alsa_snd_pcm_prepare( stream->playback.pcm ), paUnanticipatedHostError );
+            playbackPrepared = 1;
+        }
     }
     if( stream->capture.pcm && !stream->pcmsSynced )
     {
@@ -3115,6 +3120,13 @@ static PaError AlsaStart( PaAlsaStream *stream, int priming )
 end:
     return result;
 error:
+    /* Starting capture (or a later playback step) failed after playback was
+     * already prepared/started. Drop playback too so no PCM is left running
+     * when the caller unwinds the stream. */
+    if( playbackPrepared && stream->playback.pcm )
+    {
+        ENSURE_NO_GOTO_( alsa_snd_pcm_drop( stream->playback.pcm ), paUnanticipatedHostError );
+    }
     goto end;
 }
 
@@ -4149,7 +4161,15 @@ error:
     if( xrun )
     {
         /* Recover from the xrun state */
-        PA_ENSURE_NO_GOTO( PaAlsaStream_HandleXrun( self ) );
+        PaError xrunResult = PaAlsaStream_HandleXrun( self );
+        if( xrunResult != paNoError )
+        {
+            /* Recovery failed, typically because the device was unplugged
+             * (ENODEV/ESTRPIPE). Propagate the error so the callback thread
+             * terminates with a clear status instead of spinning forever. */
+            result = xrunResult;
+            goto error;
+        }
         *framesAvail = 0;
     }
     else
