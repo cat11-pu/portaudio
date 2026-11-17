@@ -83,6 +83,17 @@ typedef long ring_buffer_size_t;
 typedef long ring_buffer_size_t;
 #endif
 
+#ifndef PA_RINGBUFFER_CACHE_LINE_SIZE
+#define PA_RINGBUFFER_CACHE_LINE_SIZE 64
+#endif
+
+#if defined(_MSC_VER)
+#define PA_RINGBUFFER_ALIGN( bytes ) __declspec(align(bytes))
+#elif defined(__GNUC__)
+#define PA_RINGBUFFER_ALIGN( bytes ) __attribute__((aligned(bytes)))
+#else
+#define PA_RINGBUFFER_ALIGN( bytes )
+#endif
 
 
 #ifdef __cplusplus
@@ -90,15 +101,36 @@ extern "C"
 {
 #endif /* __cplusplus */
 
+/** Notification callback used by the optional ring buffer notifiers.
+
+ The callback runs in the producer thread (for data-available notifications)
+ or in the consumer thread (for space-available notifications). It must be
+ real-time safe: do not allocate, lock, or perform blocking I/O in it.
+*/
+typedef void (*PaUtilRingBufferNotifyCallback)( void *userData );
+
 typedef struct PaUtilRingBuffer
 {
     ring_buffer_size_t  bufferSize; /**< Number of elements in FIFO. Power of 2. Set by PaUtil_InitRingBuffer. */
-    volatile ring_buffer_size_t  writeIndex; /**< Index of next writable element. Set by PaUtil_AdvanceRingBufferWriteIndex. */
-    volatile ring_buffer_size_t  readIndex;  /**< Index of next readable element. Set by PaUtil_AdvanceRingBufferReadIndex. */
     ring_buffer_size_t  bigMask;    /**< Used for wrapping indices with extra bit to distinguish full/empty. */
     ring_buffer_size_t  smallMask;  /**< Used for fitting indices to buffer. */
     ring_buffer_size_t  elementSizeBytes; /**< Number of bytes per element. */
     char  *buffer;    /**< Pointer to the buffer containing the actual data. */
+
+    /* Keep the writer-owned and reader-owned hot fields on separate cache
+       lines. Without this padding the two indices false-share and every
+       batch transfer invalidates the other core's cache line. */
+    PA_RINGBUFFER_ALIGN(PA_RINGBUFFER_CACHE_LINE_SIZE)
+    volatile ring_buffer_size_t  writeIndex; /**< Index of next writable element. Set by PaUtil_AdvanceRingBufferWriteIndex. */
+    ring_buffer_size_t  dataAvailableThreshold; /**< Notify threshold in elements. */
+    PaUtilRingBufferNotifyCallback dataAvailableCallback; /**< Called by the writer when readable data crosses the threshold. */
+    void *dataAvailableUserData;
+
+    PA_RINGBUFFER_ALIGN(PA_RINGBUFFER_CACHE_LINE_SIZE)
+    volatile ring_buffer_size_t  readIndex;  /**< Index of next readable element. Set by PaUtil_AdvanceRingBufferReadIndex. */
+    ring_buffer_size_t  spaceAvailableThreshold; /**< Minimum writable elements for notification. */
+    PaUtilRingBufferNotifyCallback spaceAvailableCallback; /**< Called by the reader when enough writable space is available. */
+    void *spaceAvailableUserData;
 }PaUtilRingBuffer;
 
 /** Initialize Ring Buffer to empty state ready to have elements written to it.
@@ -229,6 +261,44 @@ ring_buffer_size_t PaUtil_GetRingBufferReadRegions( PaUtilRingBuffer *rbuf, ring
  @return The new position.
 */
 ring_buffer_size_t PaUtil_AdvanceRingBufferReadIndex( PaUtilRingBuffer *rbuf, ring_buffer_size_t elementCount );
+
+/** Install a lock-free data-available notification callback.
+
+ The callback is invoked by the writer when the number of readable elements
+ crosses upward through @p thresholdElements. The common low-latency use is
+ to write to an eventfd or similar RT-safe wakeup primitive. Configure the
+ notifier before starting the reader and writer threads.
+
+ @param rbuf The ring buffer.
+
+ @param thresholdElements Number of readable elements that must be present.
+
+ @param callback Callback to invoke, or NULL to disable notifications.
+
+ @param userData Opaque pointer passed to the callback.
+*/
+void PaUtil_SetRingBufferDataAvailableNotifier( PaUtilRingBuffer *rbuf,
+        ring_buffer_size_t thresholdElements,
+        PaUtilRingBufferNotifyCallback callback, void *userData );
+
+/** Install a lock-free space-available notification callback.
+
+ The callback is invoked by the reader when at least @p thresholdElements
+ are writable after a read. Unlike the data-available notifier this can fire
+ for consecutive reads, because each consumed block needs a matching refill.
+ This lets a producer sleep until the audio callback has consumed a block.
+
+ @param rbuf The ring buffer.
+
+ @param thresholdElements Number of writable elements that must be present.
+
+ @param callback Callback to invoke, or NULL to disable notifications.
+
+ @param userData Opaque pointer passed to the callback.
+*/
+void PaUtil_SetRingBufferSpaceAvailableNotifier( PaUtilRingBuffer *rbuf,
+        ring_buffer_size_t thresholdElements,
+        PaUtilRingBufferNotifyCallback callback, void *userData );
 
 #ifdef __cplusplus
 }

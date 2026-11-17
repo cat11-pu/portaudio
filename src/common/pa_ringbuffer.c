@@ -68,10 +68,16 @@ ring_buffer_size_t PaUtil_InitializeRingBuffer( PaUtilRingBuffer *rbuf, ring_buf
     if( ((elementCount-1) & elementCount) != 0) return -1; /* Not Power of two. */
     rbuf->bufferSize = elementCount;
     rbuf->buffer = (char *)dataPtr;
-    PaUtil_FlushRingBuffer( rbuf );
     rbuf->bigMask = (elementCount*2)-1;
     rbuf->smallMask = (elementCount)-1;
     rbuf->elementSizeBytes = elementSizeBytes;
+    rbuf->dataAvailableThreshold = 0;
+    rbuf->dataAvailableCallback = NULL;
+    rbuf->dataAvailableUserData = NULL;
+    rbuf->spaceAvailableThreshold = 0;
+    rbuf->spaceAvailableCallback = NULL;
+    rbuf->spaceAvailableUserData = NULL;
+    PaUtil_FlushRingBuffer( rbuf );
     return 0;
 }
 
@@ -93,6 +99,28 @@ ring_buffer_size_t PaUtil_GetRingBufferWriteAvailable( const PaUtilRingBuffer *r
 void PaUtil_FlushRingBuffer( PaUtilRingBuffer *rbuf )
 {
     rbuf->writeIndex = rbuf->readIndex = 0;
+}
+
+/***************************************************************************
+** Install notification callbacks. These fields are configured before the
+** reader and writer start, so no synchronization is required here.
+*/
+void PaUtil_SetRingBufferDataAvailableNotifier( PaUtilRingBuffer *rbuf,
+        ring_buffer_size_t thresholdElements,
+        PaUtilRingBufferNotifyCallback callback, void *userData )
+{
+    rbuf->dataAvailableThreshold = thresholdElements;
+    rbuf->dataAvailableCallback = callback;
+    rbuf->dataAvailableUserData = userData;
+}
+
+void PaUtil_SetRingBufferSpaceAvailableNotifier( PaUtilRingBuffer *rbuf,
+        ring_buffer_size_t thresholdElements,
+        PaUtilRingBufferNotifyCallback callback, void *userData )
+{
+    rbuf->spaceAvailableThreshold = thresholdElements;
+    rbuf->spaceAvailableCallback = callback;
+    rbuf->spaceAvailableUserData = userData;
 }
 
 /***************************************************************************
@@ -197,41 +225,93 @@ ring_buffer_size_t PaUtil_AdvanceRingBufferReadIndex( PaUtilRingBuffer *rbuf, ri
 ** Return elements written. */
 ring_buffer_size_t PaUtil_WriteRingBuffer( PaUtilRingBuffer *rbuf, const void *data, ring_buffer_size_t elementCount )
 {
-    ring_buffer_size_t size1, size2, numWritten;
-    void *data1, *data2;
-    numWritten = PaUtil_GetRingBufferWriteRegions( rbuf, elementCount, &data1, &size1, &data2, &size2 );
-    if( size2 > 0 )
-    {
+    ring_buffer_size_t writeIndex, readIndex, readAvailable, writeAvailable, index, firstCount;
+    const char *src = (const char *)data;
+    char *dest;
 
-        memcpy( data1, data, size1*rbuf->elementSizeBytes );
-        data = ((char *)data) + size1*rbuf->elementSizeBytes;
-        memcpy( data2, data, size2*rbuf->elementSizeBytes );
-    }
-    else
+    if( elementCount <= 0 )
+        return 0;
+
+    writeIndex = rbuf->writeIndex;
+    readIndex = rbuf->readIndex;
+    readAvailable = (writeIndex - readIndex) & rbuf->bigMask;
+    writeAvailable = rbuf->bufferSize - readAvailable;
+    if( elementCount > writeAvailable )
+        elementCount = writeAvailable;
+    if( elementCount <= 0 )
+        return 0;
+
+    index = writeIndex & rbuf->smallMask;
+    firstCount = rbuf->bufferSize - index;
+    if( firstCount > elementCount )
+        firstCount = elementCount;
+
+    dest = &rbuf->buffer[index * rbuf->elementSizeBytes];
+    memcpy( dest, src, (size_t)firstCount * rbuf->elementSizeBytes );
+    if( firstCount < elementCount )
     {
-        memcpy( data1, data, size1*rbuf->elementSizeBytes );
+        memcpy( rbuf->buffer, src + firstCount * rbuf->elementSizeBytes,
+                (size_t)(elementCount - firstCount) * rbuf->elementSizeBytes );
     }
-    PaUtil_AdvanceRingBufferWriteIndex( rbuf, numWritten );
-    return numWritten;
+
+    /* Publish the complete batch with one release operation. */
+    PaUtil_WriteMemoryBarrier();
+    rbuf->writeIndex = (writeIndex + elementCount) & rbuf->bigMask;
+
+    if( rbuf->dataAvailableCallback != NULL
+            && readAvailable < rbuf->dataAvailableThreshold
+            && readAvailable + elementCount >= rbuf->dataAvailableThreshold )
+    {
+        rbuf->dataAvailableCallback( rbuf->dataAvailableUserData );
+    }
+
+    return elementCount;
 }
 
 /***************************************************************************
 ** Return elements read. */
 ring_buffer_size_t PaUtil_ReadRingBuffer( PaUtilRingBuffer *rbuf, void *data, ring_buffer_size_t elementCount )
 {
-    ring_buffer_size_t size1, size2, numRead;
-    void *data1, *data2;
-    numRead = PaUtil_GetRingBufferReadRegions( rbuf, elementCount, &data1, &size1, &data2, &size2 );
-    if( size2 > 0 )
+    ring_buffer_size_t writeIndex, readIndex, available, index, firstCount;
+    ring_buffer_size_t writeAvailable;
+    char *dest = (char *)data;
+    const char *src;
+
+    if( elementCount <= 0 )
+        return 0;
+
+    writeIndex = rbuf->writeIndex;
+    PaUtil_ReadMemoryBarrier(); /* acquire the writer's published batch */
+    readIndex = rbuf->readIndex;
+    available = (writeIndex - readIndex) & rbuf->bigMask;
+    if( elementCount > available )
+        elementCount = available;
+    if( elementCount <= 0 )
+        return 0;
+    writeAvailable = rbuf->bufferSize - available;
+
+    index = readIndex & rbuf->smallMask;
+    firstCount = rbuf->bufferSize - index;
+    if( firstCount > elementCount )
+        firstCount = elementCount;
+
+    src = &rbuf->buffer[index * rbuf->elementSizeBytes];
+    memcpy( dest, src, (size_t)firstCount * rbuf->elementSizeBytes );
+    if( firstCount < elementCount )
     {
-        memcpy( data, data1, size1*rbuf->elementSizeBytes );
-        data = ((char *)data) + size1*rbuf->elementSizeBytes;
-        memcpy( data, data2, size2*rbuf->elementSizeBytes );
+        memcpy( dest + firstCount * rbuf->elementSizeBytes, rbuf->buffer,
+                (size_t)(elementCount - firstCount) * rbuf->elementSizeBytes );
     }
-    else
+
+    /* Publish the complete batch with one release operation. */
+    PaUtil_FullMemoryBarrier();
+    rbuf->readIndex = (readIndex + elementCount) & rbuf->bigMask;
+
+    if( rbuf->spaceAvailableCallback != NULL
+            && writeAvailable + elementCount >= rbuf->spaceAvailableThreshold )
     {
-        memcpy( data, data1, size1*rbuf->elementSizeBytes );
+        rbuf->spaceAvailableCallback( rbuf->spaceAvailableUserData );
     }
-    PaUtil_AdvanceRingBufferReadIndex( rbuf, numRead );
-    return numRead;
+
+    return elementCount;
 }
